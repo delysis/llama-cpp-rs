@@ -369,7 +369,10 @@ impl<'model> LlamaContext<'model> {
     ///
     /// Passing an empty slice clears the stack. All adapters and scales are
     /// validated before llama.cpp is called, so invalid input cannot leave a
-    /// partially changed stack.
+    /// partially changed stack. llama.cpp stores non-owning adapter pointers in
+    /// the context, while the borrowed [`LlamaModel`] owns their allocations;
+    /// dropping an [`LlamaLoraAdapter`] handle after this call is therefore safe
+    /// and does not unload the active adapter.
     ///
     /// # Errors
     ///

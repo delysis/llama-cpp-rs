@@ -29,7 +29,25 @@ pub struct LlamaModel {
     pub(crate) model: NonNull<llama_cpp_sys_2::llama_model>,
 }
 
-/// A safe wrapper around `llama_lora_adapter`.
+/// A non-owning handle to a model-owned `llama_adapter_lora`.
+///
+/// llama.cpp registers every loaded adapter with its associated model and
+/// frees it when that model is freed. Dropping this Rust handle intentionally
+/// does **not** unload the adapter: contexts retain non-owning adapter pointers,
+/// so freeing on handle drop would make an active context dangle. The model
+/// borrow both records identity and prevents the C owner from being freed while
+/// this handle exists.
+///
+/// ```compile_fail
+/// use std::path::Path;
+/// use llama_cpp_2::model::LlamaModel;
+///
+/// fn model_cannot_drop_before_adapter(model: LlamaModel, path: &Path) {
+///     let adapter = model.lora_adapter_init(path).unwrap();
+///     drop(model); // the adapter still borrows the model
+///     drop(adapter);
+/// }
+/// ```
 #[derive(Debug)]
 #[allow(clippy::module_name_repetitions)]
 pub struct LlamaLoraAdapter<'model> {
@@ -1039,6 +1057,20 @@ where
 impl Drop for LlamaModel {
     fn drop(&mut self) {
         unsafe { llama_cpp_sys_2::llama_free_model(self.model.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod lora_lifetime_tests {
+    use super::LlamaLoraAdapter;
+
+    fn needs_drop<T>() -> bool {
+        std::mem::needs_drop::<T>()
+    }
+
+    #[test]
+    fn adapter_handle_never_frees_model_owned_allocation() {
+        assert!(!needs_drop::<LlamaLoraAdapter<'static>>());
     }
 }
 
