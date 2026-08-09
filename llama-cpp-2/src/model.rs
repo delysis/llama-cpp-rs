@@ -3,8 +3,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::num::NonZeroU16;
 use std::os::raw::c_int;
 use std::path::Path;
-use std::ptr::{self, NonNull};
-use std::slice;
+use std::ptr::NonNull;
 use std::str::Utf8Error;
 
 use crate::context::params::LlamaContextParams;
@@ -30,12 +29,30 @@ pub struct LlamaModel {
     pub(crate) model: NonNull<llama_cpp_sys_2::llama_model>,
 }
 
-/// A safe wrapper around `llama_lora_adapter`.
+/// A non-owning handle to a model-owned `llama_adapter_lora`.
+///
+/// llama.cpp registers every loaded adapter with its associated model and
+/// frees it when that model is freed. Dropping this Rust handle intentionally
+/// does **not** unload the adapter: contexts retain non-owning adapter pointers,
+/// so freeing on handle drop would make an active context dangle. The model
+/// borrow both records identity and prevents the C owner from being freed while
+/// this handle exists.
+///
+/// ```compile_fail
+/// use std::path::Path;
+/// use llama_cpp_2::model::LlamaModel;
+///
+/// fn model_cannot_drop_before_adapter(model: LlamaModel, path: &Path) {
+///     let adapter = model.lora_adapter_init(path).unwrap();
+///     drop(model); // the adapter still borrows the model
+///     drop(adapter);
+/// }
+/// ```
 #[derive(Debug)]
-#[repr(transparent)]
 #[allow(clippy::module_name_repetitions)]
-pub struct LlamaLoraAdapter {
+pub struct LlamaLoraAdapter<'model> {
     pub(crate) lora_adapter: NonNull<llama_cpp_sys_2::llama_adapter_lora>,
+    pub(crate) model: &'model LlamaModel,
 }
 
 /// A performance-friendly wrapper around [`LlamaModel::chat_template`] which is then
@@ -788,7 +805,7 @@ impl LlamaModel {
     pub fn lora_adapter_init(
         &self,
         path: impl AsRef<Path>,
-    ) -> Result<LlamaLoraAdapter, LlamaLoraAdapterInitError> {
+    ) -> Result<LlamaLoraAdapter<'_>, LlamaLoraAdapterInitError> {
         let path = path.as_ref();
         debug_assert!(Path::new(path).exists(), "{path:?} does not exist");
 
@@ -807,6 +824,7 @@ impl LlamaModel {
         tracing::debug!(?path, "Initialized lora adapter");
         Ok(LlamaLoraAdapter {
             lora_adapter: adapter,
+            model: self,
         })
     }
 
@@ -895,10 +913,12 @@ impl LlamaModel {
 
         let mut sampler_configs: Vec<llama_cpp_sys_2::llama_sampler_seq_config> = samplers
             .iter()
-            .map(|(seq_id, sampler)| llama_cpp_sys_2::llama_sampler_seq_config {
-                seq_id: *seq_id,
-                sampler: sampler.sampler,
-            })
+            .map(
+                |(seq_id, sampler)| llama_cpp_sys_2::llama_sampler_seq_config {
+                    seq_id: *seq_id,
+                    sampler: sampler.sampler,
+                },
+            )
             .collect();
 
         if !sampler_configs.is_empty() {
@@ -911,7 +931,12 @@ impl LlamaModel {
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::with_samplers(self, context, params.embeddings(), samplers))
+        Ok(LlamaContext::with_samplers(
+            self,
+            context,
+            params.embeddings(),
+            samplers,
+        ))
     }
 
     /// Apply the models chat template to some messages.
@@ -1032,6 +1057,20 @@ where
 impl Drop for LlamaModel {
     fn drop(&mut self) {
         unsafe { llama_cpp_sys_2::llama_free_model(self.model.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod lora_lifetime_tests {
+    use super::LlamaLoraAdapter;
+
+    fn needs_drop<T>() -> bool {
+        std::mem::needs_drop::<T>()
+    }
+
+    #[test]
+    fn adapter_handle_never_frees_model_owned_allocation() {
+        assert!(!needs_drop::<LlamaLoraAdapter<'static>>());
     }
 }
 

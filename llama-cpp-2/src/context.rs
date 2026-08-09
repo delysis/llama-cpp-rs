@@ -5,6 +5,7 @@ use std::num::NonZeroI32;
 use std::ptr::NonNull;
 use std::slice;
 
+use crate::context::params::LlamaPoolingType;
 use crate::llama_batch::LlamaBatch;
 use crate::model::{LlamaLoraAdapter, LlamaModel};
 use crate::sampling::LlamaSampler;
@@ -13,8 +14,8 @@ use crate::token::data::LlamaTokenData;
 use crate::token::data_array::LlamaTokenDataArray;
 use crate::token::LlamaToken;
 use crate::{
-    DecodeError, EmbeddingsError, EncodeError, LlamaLoraAdapterRemoveError,
-    LlamaLoraAdapterSetError,
+    DecodeError, EmbeddingsError, EncodeError, LlamaControlVectorError,
+    LlamaLoraAdapterRemoveError, LlamaLoraAdapterSetError,
 };
 
 pub mod kv_cache;
@@ -87,6 +88,17 @@ impl<'model> LlamaContext<'model> {
     #[must_use]
     pub fn n_ctx(&self) -> u32 {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
+    }
+
+    /// Returns the context's live embedding pooling mode.
+    ///
+    /// This reports the resolved mode used by llama.cpp, which can differ from
+    /// the value originally requested through context parameters when that
+    /// value was [`LlamaPoolingType::Unspecified`].
+    #[must_use]
+    pub fn pooling_type(&self) -> LlamaPoolingType {
+        let pooling = unsafe { llama_cpp_sys_2::llama_pooling_type(self.context.as_ptr()) };
+        LlamaPoolingType::from(pooling)
     }
 
     /// Decodes the batch.
@@ -347,24 +359,62 @@ impl<'model> LlamaContext<'model> {
     /// See [`LlamaLoraAdapterSetError`] for more information.
     pub fn lora_adapter_set(
         &self,
-        adapter: &mut LlamaLoraAdapter,
+        adapter: &mut LlamaLoraAdapter<'_>,
         scale: f32,
     ) -> Result<(), LlamaLoraAdapterSetError> {
-        let mut adapters = [adapter.lora_adapter.as_ptr()];
-        let mut scales = [scale];
+        self.lora_adapters_set(&[(&*adapter, scale)])
+    }
+
+    /// Atomically replaces every `LoRA` adapter active on this context.
+    ///
+    /// Passing an empty slice clears the stack. All adapters and scales are
+    /// validated before llama.cpp is called, so invalid input cannot leave a
+    /// partially changed stack. llama.cpp stores non-owning adapter pointers in
+    /// the context, while the borrowed [`LlamaModel`] owns their allocations;
+    /// dropping an [`LlamaLoraAdapter`] handle after this call is therefore safe
+    /// and does not unload the active adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlamaLoraAdapterSetError`] if a scale is non-finite, an
+    /// adapter belongs to another model, an adapter is duplicated, or
+    /// llama.cpp rejects the replacement.
+    pub fn lora_adapters_set(
+        &self,
+        adapters: &[(&LlamaLoraAdapter<'_>, f32)],
+    ) -> Result<(), LlamaLoraAdapterSetError> {
+        validate_lora_adapters(self.model, adapters)?;
+
+        let mut adapter_ptrs: Vec<_> = adapters
+            .iter()
+            .map(|(adapter, _)| adapter.lora_adapter.as_ptr())
+            .collect();
+        let mut scales: Vec<_> = adapters.iter().map(|(_, scale)| *scale).collect();
+
+        let adapter_ptr = if adapter_ptrs.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            adapter_ptrs.as_mut_ptr()
+        };
+        let scales_ptr = if scales.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            scales.as_mut_ptr()
+        };
+
         let err_code = unsafe {
             llama_cpp_sys_2::llama_set_adapters_lora(
                 self.context.as_ptr(),
-                adapters.as_mut_ptr(),
-                1,
-                scales.as_mut_ptr(),
+                adapter_ptr,
+                adapter_ptrs.len(),
+                scales_ptr,
             )
         };
         if err_code != 0 {
             return Err(LlamaLoraAdapterSetError::ErrorResult(err_code));
         }
 
-        tracing::debug!("Set lora adapter");
+        tracing::debug!(adapter_count = adapters.len(), "Replaced lora adapters");
         Ok(())
     }
 
@@ -378,7 +428,7 @@ impl<'model> LlamaContext<'model> {
     /// See [`LlamaLoraAdapterRemoveError`] for more information.
     pub fn lora_adapter_remove(
         &self,
-        _adapter: &mut LlamaLoraAdapter,
+        _adapter: &mut LlamaLoraAdapter<'_>,
     ) -> Result<(), LlamaLoraAdapterRemoveError> {
         let err_code = unsafe {
             llama_cpp_sys_2::llama_set_adapters_lora(
@@ -393,6 +443,75 @@ impl<'model> LlamaContext<'model> {
         }
 
         tracing::debug!("Remove lora adapter");
+        Ok(())
+    }
+
+    /// Sets a static additive control vector on an inclusive range of model
+    /// layers.
+    ///
+    /// `data` must contain exactly one `n_embd`-wide row for every non-zero
+    /// model layer, ordered from layer 1 through `model.n_layer() - 1`. Requiring
+    /// the complete buffer prevents a shorter replacement from retaining stale
+    /// rows in llama.cpp's already allocated control-vector storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlamaControlVectorError`] for an invalid model dimension,
+    /// layer range, buffer length, non-finite value, or llama.cpp error.
+    pub fn control_vector_set(
+        &self,
+        data: &[f32],
+        layer_start: u32,
+        layer_end: u32,
+    ) -> Result<(), LlamaControlVectorError> {
+        let (n_embd, layer_start, layer_end) = validate_control_vector(
+            self.model.n_embd(),
+            self.model.n_layer(),
+            data,
+            layer_start,
+            layer_end,
+        )?;
+
+        let err_code = unsafe {
+            llama_cpp_sys_2::llama_set_adapter_cvec(
+                self.context.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                n_embd,
+                layer_start,
+                layer_end,
+            )
+        };
+        if err_code != 0 {
+            return Err(LlamaControlVectorError::ErrorResult(err_code));
+        }
+
+        tracing::debug!(layer_start, layer_end, "Set control vector");
+        Ok(())
+    }
+
+    /// Clears the static additive control vector from this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlamaControlVectorError::ErrorResult`] if llama.cpp rejects
+    /// the operation.
+    pub fn control_vector_clear(&self) -> Result<(), LlamaControlVectorError> {
+        let err_code = unsafe {
+            llama_cpp_sys_2::llama_set_adapter_cvec(
+                self.context.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        if err_code != 0 {
+            return Err(LlamaControlVectorError::ErrorResult(err_code));
+        }
+
+        tracing::debug!("Cleared control vector");
         Ok(())
     }
 
@@ -426,8 +545,168 @@ impl<'model> LlamaContext<'model> {
     }
 }
 
+fn validate_lora_adapters(
+    context_model: &LlamaModel,
+    adapters: &[(&LlamaLoraAdapter<'_>, f32)],
+) -> Result<(), LlamaLoraAdapterSetError> {
+    for (index, (adapter, scale)) in adapters.iter().enumerate() {
+        if !scale.is_finite() {
+            return Err(LlamaLoraAdapterSetError::NonFiniteScale { index });
+        }
+        if !std::ptr::eq(adapter.model, context_model) {
+            return Err(LlamaLoraAdapterSetError::ModelMismatch { index });
+        }
+        if let Some(first_index) = adapters[..index]
+            .iter()
+            .position(|(prior, _)| prior.lora_adapter == adapter.lora_adapter)
+        {
+            return Err(LlamaLoraAdapterSetError::DuplicateAdapter {
+                first_index,
+                duplicate_index: index,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_control_vector(
+    n_embd: i32,
+    layer_count: u32,
+    data: &[f32],
+    layer_start: u32,
+    layer_end: u32,
+) -> Result<(i32, i32, i32), LlamaControlVectorError> {
+    let n_embd_usize = usize::try_from(n_embd)
+        .ok()
+        .filter(|width| *width > 0)
+        .ok_or(LlamaControlVectorError::InvalidEmbeddingWidth(n_embd))?;
+
+    if layer_count < 2 {
+        return Err(LlamaControlVectorError::InsufficientLayers(layer_count));
+    }
+    if layer_start == 0 || layer_start > layer_end || layer_end >= layer_count {
+        return Err(LlamaControlVectorError::InvalidLayerRange {
+            start: layer_start,
+            end: layer_end,
+            layer_count,
+        });
+    }
+
+    let row_count =
+        usize::try_from(layer_count - 1).map_err(|_| LlamaControlVectorError::LengthOverflow)?;
+    let expected = n_embd_usize
+        .checked_mul(row_count)
+        .ok_or(LlamaControlVectorError::LengthOverflow)?;
+    if data.len() != expected {
+        return Err(LlamaControlVectorError::LengthMismatch {
+            expected,
+            actual: data.len(),
+        });
+    }
+    if let Some(index) = data.iter().position(|value| !value.is_finite()) {
+        return Err(LlamaControlVectorError::NonFiniteValue { index });
+    }
+
+    let layer_start = i32::try_from(layer_start)
+        .map_err(|_| LlamaControlVectorError::LayerIndexOutOfRange(layer_start))?;
+    let layer_end = i32::try_from(layer_end)
+        .map_err(|_| LlamaControlVectorError::LayerIndexOutOfRange(layer_end))?;
+    Ok((n_embd, layer_start, layer_end))
+}
+
 impl Drop for LlamaContext<'_> {
     fn drop(&mut self) {
         unsafe { llama_cpp_sys_2::llama_free(self.context.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod lora_adapter_tests {
+    use std::mem::ManuallyDrop;
+    use std::ptr::NonNull;
+
+    use super::validate_lora_adapters;
+    use crate::model::{LlamaLoraAdapter, LlamaModel};
+    use crate::LlamaLoraAdapterSetError;
+
+    #[test]
+    fn rejects_invalid_stacks_before_ffi() {
+        let model = ManuallyDrop::new(LlamaModel {
+            model: NonNull::dangling(),
+        });
+        let other_model = ManuallyDrop::new(LlamaModel {
+            model: NonNull::dangling(),
+        });
+        let adapter = LlamaLoraAdapter {
+            lora_adapter: NonNull::dangling(),
+            model: &model,
+        };
+        let other_adapter = LlamaLoraAdapter {
+            lora_adapter: NonNull::dangling(),
+            model: &other_model,
+        };
+
+        assert_eq!(validate_lora_adapters(&model, &[]), Ok(()));
+        assert_eq!(
+            validate_lora_adapters(&model, &[(&adapter, f32::NAN)]),
+            Err(LlamaLoraAdapterSetError::NonFiniteScale { index: 0 })
+        );
+        assert_eq!(
+            validate_lora_adapters(&model, &[(&other_adapter, 1.0)]),
+            Err(LlamaLoraAdapterSetError::ModelMismatch { index: 0 })
+        );
+        assert_eq!(
+            validate_lora_adapters(&model, &[(&adapter, 1.0), (&adapter, 0.5)]),
+            Err(LlamaLoraAdapterSetError::DuplicateAdapter {
+                first_index: 0,
+                duplicate_index: 1,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod control_vector_tests {
+    use super::validate_control_vector;
+    use crate::LlamaControlVectorError;
+
+    #[test]
+    fn accepts_complete_finite_nonzero_layer_matrix() {
+        let data = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(validate_control_vector(2, 3, &data, 1, 2), Ok((2, 1, 2)));
+    }
+
+    #[test]
+    fn rejects_short_matrix_that_could_retain_stale_layers() {
+        assert_eq!(
+            validate_control_vector(2, 3, &[0.0, 1.0], 1, 1),
+            Err(LlamaControlVectorError::LengthMismatch {
+                expected: 4,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_and_out_of_bounds_layers() {
+        let data = [0.0, 1.0, 2.0, 3.0];
+        for (start, end) in [(0, 1), (2, 1), (1, 3)] {
+            assert_eq!(
+                validate_control_vector(2, 3, &data, start, end),
+                Err(LlamaControlVectorError::InvalidLayerRange {
+                    start,
+                    end,
+                    layer_count: 3,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_nonfinite_values_before_ffi() {
+        assert_eq!(
+            validate_control_vector(2, 3, &[0.0, 1.0, f32::NAN, 3.0], 1, 2),
+            Err(LlamaControlVectorError::NonFiniteValue { index: 2 })
+        );
     }
 }

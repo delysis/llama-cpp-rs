@@ -260,9 +260,87 @@ pub enum LlamaLoraAdapterInitError {
 /// An error that can occur when loading a model.
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum LlamaLoraAdapterSetError {
+    /// A scale was NaN or infinite.
+    #[error("adapter scale at index {index} is not finite")]
+    NonFiniteScale {
+        /// Index of the invalid adapter/scale pair.
+        index: usize,
+    },
+    /// The adapter was loaded for a different model than the context uses.
+    #[error("adapter at index {index} belongs to a different model")]
+    ModelMismatch {
+        /// Index of the incompatible adapter.
+        index: usize,
+    },
+    /// The same adapter appeared more than once in one atomic replacement.
+    #[error("adapter at index {duplicate_index} duplicates index {first_index}")]
+    DuplicateAdapter {
+        /// Index where the adapter first appeared.
+        first_index: usize,
+        /// Index of the duplicate entry.
+        duplicate_index: usize,
+    },
     /// llama.cpp returned a non-zero error code.
-    #[error("error code from llama cpp")]
+    #[error("error code {0} from llama cpp")]
     ErrorResult(i32),
+}
+
+/// An error that can occur while setting a static control vector.
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LlamaControlVectorError {
+    /// The model reported an invalid embedding width.
+    #[error("model embedding width must be positive, got {0}")]
+    InvalidEmbeddingWidth(i32),
+    /// The model has no layer to which llama.cpp can apply a control vector.
+    #[error("model must have at least two layers, got {0}")]
+    InsufficientLayers(u32),
+    /// The inclusive layer range was not within `1..model.n_layer()`.
+    #[error("invalid inclusive layer range {start}..={end} for model with {layer_count} layers")]
+    InvalidLayerRange {
+        /// First controlled layer.
+        start: u32,
+        /// Last controlled layer.
+        end: u32,
+        /// Number of layers reported by the model.
+        layer_count: u32,
+    },
+    /// Computing the required full-vector length overflowed `usize`.
+    #[error("control-vector length overflow")]
+    LengthOverflow,
+    /// The vector did not contain exactly one row for every non-zero model layer.
+    #[error("control-vector length mismatch: expected {expected}, got {actual}")]
+    LengthMismatch {
+        /// Required number of `f32` values.
+        expected: usize,
+        /// Supplied number of `f32` values.
+        actual: usize,
+    },
+    /// A vector element was NaN or infinite.
+    #[error("control-vector value at index {index} is not finite")]
+    NonFiniteValue {
+        /// Index of the invalid value.
+        index: usize,
+    },
+    /// A validated layer index could not be represented by llama.cpp's API.
+    #[error("layer index {0} does not fit into i32")]
+    LayerIndexOutOfRange(u32),
+    /// llama.cpp returned a non-zero error code.
+    #[error("error code {0} from llama cpp")]
+    ErrorResult(i32),
+}
+
+/// Failed to clone a llama.cpp sampler.
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum LlamaSamplerCloneError {
+    /// The source sampler pointer was null.
+    #[error("source sampler is null")]
+    NullSource,
+    /// The sampler owns state but does not provide a clone callback.
+    #[error("sampler does not support cloning")]
+    Unsupported,
+    /// llama.cpp returned a null pointer while cloning the sampler.
+    #[error("llama.cpp returned a null sampler clone")]
+    NullResult,
 }
 
 /// An error that can occur when loading a model.

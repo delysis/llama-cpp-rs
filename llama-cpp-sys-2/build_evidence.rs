@@ -168,7 +168,8 @@ impl BuildEvidence {
             if input.external {
                 // An external artifact can change without any vendored source changing.
                 // This is intentionally a Cargo rerun directive, not links metadata.
-                println!("cargo:rerun-if-changed={}", input.path.display());
+                let directive_path = cargo_directive_path(&input.path)?;
+                println!("cargo:rerun-if-changed={directive_path}");
             }
             let (byte_len, sha256) = hash_stable_file(&input.path).map_err(|error| {
                 format!(
@@ -360,6 +361,16 @@ fn validate_logical_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cargo_directive_path(path: &Path) -> Result<&str, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| "external native artifact path is not UTF-8".to_owned())?;
+    if path.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+        return Err("external native artifact path contains a line break".to_owned());
+    }
+    Ok(path)
+}
+
 fn hash_stable_file(path: &Path) -> io::Result<(u64, String)> {
     let mut file = File::open(path)?;
     let before = file.metadata()?;
@@ -543,6 +554,21 @@ mod tests {
         assert!(validate_logical_name("ggml/CPU/link").is_err());
         assert!(validate_features(&["metal".to_owned(), "common".to_owned()]).is_err());
         assert!(validate_features(&["future-feature".to_owned()]).is_err());
+        assert!(cargo_directive_path(Path::new("/tmp/lib.a\ncargo:warning=injected")).is_err());
+    }
+
+    #[test]
+    fn linkage_grammar_distinguishes_each_native_choice() {
+        assert_eq!(
+            LinkageEvidence {
+                local: NativeLinkage::Shared,
+                ggml_origin: GgmlOrigin::System,
+                ggml: NativeLinkage::Static,
+                backends: BackendLinkage::DynamicModules,
+            }
+            .canonical(),
+            "local=shared;ggml-origin=system;ggml=static;backends=dynamic-modules"
+        );
     }
 
     #[test]

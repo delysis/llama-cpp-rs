@@ -3,6 +3,7 @@
 use std::borrow::Borrow;
 use std::ffi::{c_char, CString};
 use std::fmt::{Debug, Formatter};
+use std::ptr::NonNull;
 
 use crate::context::LlamaContext;
 use crate::model::LlamaModel;
@@ -11,7 +12,7 @@ use crate::status_is_ok;
 use crate::token::data_array::LlamaTokenDataArray;
 use crate::token::logit_bias::LlamaLogitBias;
 use crate::token::LlamaToken;
-use crate::{GrammarError, SamplerAcceptError};
+use crate::{GrammarError, LlamaSamplerCloneError, SamplerAcceptError};
 
 /// A safe wrapper around `llama_sampler`.
 pub struct LlamaSampler {
@@ -25,6 +26,45 @@ impl Debug for LlamaSampler {
 }
 
 impl LlamaSampler {
+    /// Clones this sampler, including any sampler state that llama.cpp's clone
+    /// callback preserves.
+    ///
+    /// This checks the public sampler interface before calling
+    /// `llama_sampler_clone`, because llama.cpp aborts the process when a
+    /// stateful sampler has no clone callback. A failed capability check is
+    /// therefore returned as an ordinary error instead of crossing that abort
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlamaSamplerCloneError`] if the source is null, the sampler
+    /// does not support cloning, or llama.cpp returns a null clone.
+    pub fn try_clone(&self) -> Result<Self, LlamaSamplerCloneError> {
+        let sampler = NonNull::new(self.sampler).ok_or(LlamaSamplerCloneError::NullSource)?;
+
+        // SAFETY: `sampler` came from this live owning wrapper. An immutable
+        // borrow prevents safe Rust callers from concurrently mutating or
+        // dropping it. llama.cpp publishes both structs in llama.h and keeps
+        // the interface table alive for the sampler's lifetime.
+        let source = unsafe { sampler.as_ref() };
+        let interface = NonNull::new(source.iface).ok_or(LlamaSamplerCloneError::Unsupported)?;
+        // SAFETY: the interface pointer is non-null and valid for the source
+        // sampler's lifetime, as established above.
+        let clone_callback = unsafe { interface.as_ref().clone };
+        if clone_callback.is_none() && !source.ctx.is_null() {
+            return Err(LlamaSamplerCloneError::Unsupported);
+        }
+
+        // SAFETY: the preflight above excludes llama.cpp's documented abort
+        // case. On success the returned pointer transfers unique ownership to
+        // the new wrapper and is released by its `Drop` implementation.
+        let cloned = unsafe { llama_cpp_sys_2::llama_sampler_clone(sampler.as_ptr()) };
+        let cloned = NonNull::new(cloned).ok_or(LlamaSamplerCloneError::NullResult)?;
+        Ok(Self {
+            sampler: cloned.as_ptr(),
+        })
+    }
+
     /// Sample and accept a token from the idx-th output of the last evaluation
     #[must_use]
     pub fn sample(&mut self, ctx: &LlamaContext, idx: i32) -> LlamaToken {
@@ -263,6 +303,19 @@ impl LlamaSampler {
     #[must_use]
     pub fn top_n_sigma(n: f32) -> Self {
         let sampler = unsafe { llama_cpp_sys_2::llama_sampler_init_top_n_sigma(n) };
+        Self { sampler }
+    }
+
+    /// Adaptive-p terminal sampling.
+    ///
+    /// `target` selects tokens near the requested probability and may be
+    /// negative to disable adaptation. `decay` is the history EMA decay and is
+    /// normally in `0.0..=0.99`. As with llama.cpp's other sampler
+    /// constructors, values are passed through unchanged.
+    #[must_use]
+    pub fn adaptive_p(target: f32, decay: f32, seed: u32) -> Self {
+        let sampler =
+            unsafe { llama_cpp_sys_2::llama_sampler_init_adaptive_p(target, decay, seed) };
         Self { sampler }
     }
 
@@ -652,6 +705,17 @@ impl LlamaSampler {
 
         Self { sampler }
     }
+
+    /// Fill-in-the-middle post-processing sampler.
+    ///
+    /// llama.cpp expects this after probability filters such as top-k and
+    /// top-p. It groups candidate token pieces by prefix and handles FIM end
+    /// tokens using the model's vocabulary.
+    #[must_use]
+    pub fn infill(model: &LlamaModel) -> Self {
+        let sampler = unsafe { llama_cpp_sys_2::llama_sampler_init_infill(model.vocab_ptr()) };
+        Self { sampler }
+    }
 }
 
 impl Drop for LlamaSampler {
@@ -659,5 +723,33 @@ impl Drop for LlamaSampler {
         unsafe {
             llama_cpp_sys_2::llama_sampler_free(self.sampler);
         }
+    }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::LlamaSampler;
+    use crate::LlamaSamplerCloneError;
+
+    #[test]
+    fn clones_stateful_sampler_into_distinct_owner() {
+        let sampler = LlamaSampler::dist(0x5eed);
+        let cloned = sampler
+            .try_clone()
+            .expect("dist sampler should be cloneable");
+
+        assert_ne!(sampler.sampler, cloned.sampler);
+        assert_eq!(sampler.get_seed(), cloned.get_seed());
+    }
+
+    #[test]
+    fn rejects_null_source_without_calling_ffi() {
+        let sampler = LlamaSampler {
+            sampler: std::ptr::null_mut(),
+        };
+        assert!(matches!(
+            sampler.try_clone(),
+            Err(LlamaSamplerCloneError::NullSource)
+        ));
     }
 }
