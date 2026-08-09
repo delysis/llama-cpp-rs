@@ -8,6 +8,18 @@ use cmake::Config;
 use glob::glob;
 use walkdir::DirEntry;
 
+mod build_evidence;
+
+use build_evidence::{
+    ArtifactInput, BackendLinkage, BuildEvidence, GgmlOrigin, LinkageEvidence, NativeLinkage,
+};
+
+#[derive(Debug)]
+struct NativeLibrary {
+    name: String,
+    path: PathBuf,
+}
+
 enum WindowsVariant {
     Msvc,
     Other,
@@ -98,7 +110,11 @@ fn get_cargo_target_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(target_dir.to_path_buf())
 }
 
-fn extract_lib_names(out_dir: &Path, build_shared_libs: bool, target_os: &TargetOs) -> Vec<String> {
+fn extract_libraries(
+    out_dir: &Path,
+    build_shared_libs: bool,
+    target_os: &TargetOs,
+) -> Vec<NativeLibrary> {
     let lib_pattern = match target_os {
         // MSVC emits .lib; the GNU (MinGW) toolchain emits .a static archives.
         TargetOs::Windows(WindowsVariant::Msvc) => "*.lib",
@@ -118,51 +134,59 @@ fn extract_lib_names(out_dir: &Path, build_shared_libs: bool, target_os: &Target
             }
         }
     };
-    let libs_dir = out_dir.join("lib*");
-    let pattern = libs_dir.join(lib_pattern);
-    debug_log!("Extract libs {}", pattern.display());
+    let mut libraries = std::collections::BTreeMap::new();
+    // This is also the rustc link-search order below. A duplicate logical
+    // library therefore resolves to the first directory, not to glob order.
+    for libs_dir in [out_dir.join("lib"), out_dir.join("lib64")] {
+        let pattern = libs_dir.join(lib_pattern);
+        debug_log!("Extract libs {}", pattern.display());
+        for entry in glob(pattern.to_str().unwrap()).unwrap() {
+            match entry {
+                Ok(mut path) => {
+                    let stem = path.file_stem().unwrap();
+                    let stem_str = stem.to_str().unwrap();
 
-    let mut lib_names: Vec<String> = Vec::new();
-
-    // Process the libraries based on the pattern
-    for entry in glob(pattern.to_str().unwrap()).unwrap() {
-        match entry {
-            Ok(path) => {
-                let stem = path.file_stem().unwrap();
-                let stem_str = stem.to_str().unwrap();
-
-                // Remove the "lib" prefix if present
-                let lib_name = if stem_str.starts_with("lib") {
-                    stem_str.strip_prefix("lib").unwrap_or(stem_str)
-                } else {
-                    if path.extension() == Some(std::ffi::OsStr::new("a")) {
-                        let target = path.parent().unwrap().join(format!("lib{}.a", stem_str));
-                        std::fs::rename(&path, &target).unwrap_or_else(|e| {
-                            panic!("Failed to rename {path:?} to {target:?}: {e:?}");
-                        })
-                    }
-                    stem_str
-                };
-                lib_names.push(lib_name.to_string());
+                    // Remove the "lib" prefix if present.
+                    let lib_name = if let Some(name) = stem_str.strip_prefix("lib") {
+                        name.to_owned()
+                    } else {
+                        let name = stem_str.to_owned();
+                        if path.extension() == Some(std::ffi::OsStr::new("a")) {
+                            let target = path.parent().unwrap().join(format!("lib{name}.a"));
+                            std::fs::rename(&path, &target).unwrap_or_else(|error| {
+                                panic!("Failed to rename {path:?} to {target:?}: {error:?}");
+                            });
+                            path = target;
+                        }
+                        name
+                    };
+                    libraries.entry(lib_name.clone()).or_insert(NativeLibrary {
+                        name: lib_name,
+                        path,
+                    });
+                }
+                Err(error) => println!("cargo:warning=error={error}"),
             }
-            Err(e) => println!("cargo:warning=error={}", e),
         }
     }
-    lib_names
+    libraries.into_values().collect()
 }
 
 fn extract_lib_assets(out_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
-    let shared_lib_pattern = match target_os {
-        TargetOs::Windows(_) => "*.dll",
-        TargetOs::Apple(_) => "*.dylib",
-        TargetOs::Linux | TargetOs::Android => "*.so",
-    };
-
     let shared_libs_dir = match target_os {
         TargetOs::Windows(_) => "bin",
         _ => "lib",
     };
     let libs_dir = out_dir.join(shared_libs_dir);
+    extract_shared_assets_in(&libs_dir, target_os)
+}
+
+fn extract_shared_assets_in(libs_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
+    let shared_lib_pattern = match target_os {
+        TargetOs::Windows(_) => "*.dll",
+        TargetOs::Apple(_) => "*.dylib",
+        TargetOs::Linux | TargetOs::Android => "*.so",
+    };
     let pattern = libs_dir.join(shared_lib_pattern);
     debug_log!("Extract lib assets {}", pattern.display());
     let mut files = Vec::new();
@@ -179,12 +203,12 @@ fn extract_lib_assets(out_dir: &Path, target_os: &TargetOs) -> Vec<PathBuf> {
     files
 }
 
-fn library_file_exists(
+fn find_library_file(
     search_dirs: &[PathBuf],
     lib_name: &str,
     build_shared_libs: bool,
     target_os: &TargetOs,
-) -> bool {
+) -> Option<PathBuf> {
     let (prefixes, extensions): (&[&str], &[&str]) = match target_os {
         TargetOs::Windows(_) => (&["", "lib"], &["lib"]),
         TargetOs::Apple(_) => {
@@ -203,14 +227,77 @@ fn library_file_exists(
         }
     };
 
-    search_dirs.iter().any(|dir| {
-        prefixes.iter().any(|prefix| {
-            extensions.iter().any(|extension| {
-                dir.join(format!("{prefix}{lib_name}.{extension}"))
-                    .is_file()
+    search_dirs.iter().find_map(|dir| {
+        prefixes.iter().find_map(|prefix| {
+            extensions.iter().find_map(|extension| {
+                let path = dir.join(format!("{prefix}{lib_name}.{extension}"));
+                path.is_file().then_some(path)
             })
         })
     })
+}
+
+fn find_static_archive(directory: &Path, lib_name: &str) -> Option<PathBuf> {
+    [
+        directory.join(format!("lib{lib_name}.a")),
+        directory.join(format!("{lib_name}.a")),
+        directory.join(format!("{lib_name}.lib")),
+        directory.join(format!("lib{lib_name}.lib")),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+fn canonical_artifact_component(lib_name: &str) -> String {
+    lib_name
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' => (byte + (b'a' - b'A')) as char,
+            b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => byte as char,
+            _ => '_',
+        })
+        .collect()
+}
+
+fn linked_artifact_name(lib_name: &str) -> String {
+    let component = canonical_artifact_component(lib_name);
+    let family = if component.starts_with("ggml") {
+        "ggml"
+    } else if component == "llama" {
+        "llama"
+    } else if component.contains("common") {
+        "common"
+    } else if component.starts_with("mtmd") {
+        "mtmd"
+    } else {
+        "native"
+    };
+    format!("{family}/{component}/link")
+}
+
+fn runtime_artifact_name(file_name: &str, family: &str) -> String {
+    let component = canonical_artifact_component(file_name);
+    format!("{family}/{component}/runtime")
+}
+
+fn insert_artifact(
+    artifacts: &mut std::collections::BTreeMap<String, ArtifactInput>,
+    artifact: ArtifactInput,
+) {
+    if let Some(existing) = artifacts.get(&artifact.logical_name) {
+        assert_eq!(
+            existing.path, artifact.path,
+            "native artifact logical name resolves to multiple files: {}",
+            artifact.logical_name
+        );
+        assert_eq!(
+            existing.external, artifact.external,
+            "native artifact origin is inconsistent: {}",
+            artifact.logical_name
+        );
+        return;
+    }
+    artifacts.insert(artifact.logical_name.clone(), artifact);
 }
 
 fn macos_link_search_path() -> Option<String> {
@@ -390,6 +477,10 @@ fn is_hidden(e: &DirEntry) -> bool {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_evidence.rs");
+
+    let effective_features = build_evidence::effective_features()
+        .unwrap_or_else(|error| panic!("cannot determine native build features: {error}"));
 
     let (target_os, target_triple) =
         parse_target_os().unwrap_or_else(|t| panic!("Failed to parse target os {t}"));
@@ -666,6 +757,7 @@ fn main() {
     // Pass CMAKE_ environment variables down to CMake
     for (key, value) in env::vars() {
         if key.starts_with("CMAKE_") {
+            println!("cargo:rerun-if-env-changed={key}");
             config.define(&key, &value);
         }
     }
@@ -1144,33 +1236,28 @@ fn main() {
     );
     println!("cargo:rustc-link-search={}", build_dir.display());
 
-    if cfg!(feature = "system-ggml") {
-        // Extract library directory from CMake's found GGML package
-        let cmake_cache = build_dir.join("build").join("CMakeCache.txt");
-        if let Ok(cache_contents) = std::fs::read_to_string(&cmake_cache) {
-            let mut ggml_lib_dirs = std::collections::HashSet::new();
-
-            // Parse CMakeCache.txt to find where GGML libraries were found
-            for line in cache_contents.lines() {
-                if line.starts_with("GGML_LIBRARY:")
-                    || line.starts_with("GGML_BASE_LIBRARY:")
-                    || line.starts_with("GGML_CPU_LIBRARY:")
-                {
-                    if let Some(lib_path) = line.split('=').nth(1) {
-                        if let Some(parent) = Path::new(lib_path).parent() {
-                            ggml_lib_dirs.insert(parent.to_path_buf());
-                        }
-                    }
-                }
-            }
-
-            // Add each unique library directory to the search path
-            for lib_dir in ggml_lib_dirs {
-                println!("cargo:rustc-link-search=native={}", lib_dir.display());
-                debug_log!("Added system GGML library path: {}", lib_dir.display());
-            }
+    let system_ggml_artifacts = if cfg!(feature = "system-ggml") {
+        if cfg!(feature = "dynamic-backends") {
+            panic!(
+                "system-ggml with dynamic-backends cannot emit complete build evidence: the \
+                 system package does not expose the runtime backend module paths"
+            );
         }
-    }
+        let cmake_cache = build_dir.join("build").join("CMakeCache.txt");
+        let artifacts = build_evidence::system_ggml_artifacts(&cmake_cache, true)
+            .unwrap_or_else(|error| panic!("cannot bind selected system GGML artifacts: {error}"));
+        let ggml_lib_dirs: std::collections::BTreeSet<_> = artifacts
+            .iter()
+            .filter_map(|artifact| artifact.path.parent().map(Path::to_path_buf))
+            .collect();
+        for lib_dir in ggml_lib_dirs {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+            debug_log!("Added system GGML library path: {}", lib_dir.display());
+        }
+        artifacts
+    } else {
+        Vec::new()
+    };
 
     if cfg!(feature = "cuda") && !build_shared_libs {
         // Re-run build script if CUDA_PATH environment variable changes
@@ -1269,18 +1356,42 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=mkl_rt");
     }
 
-    // Link libraries
-    let llama_libs_kind = if build_shared_libs
-        || (cfg!(feature = "system-ggml") && !cfg!(feature = "system-ggml-static"))
-    {
-        "dylib"
-    } else {
+    // Link local libraries according to what CMake actually built. System GGML
+    // has an independent linkage choice and must not change the local llama
+    // archive kind.
+    let local_libs_kind = if build_shared_libs { "dylib" } else { "static" };
+    let system_ggml_libs_kind = if cfg!(feature = "system-ggml-static") {
         "static"
+    } else {
+        "dylib"
     };
 
-    let llama_libs = extract_lib_names(&out_dir, build_shared_libs, &target_os);
+    let llama_libs = extract_libraries(&out_dir, build_shared_libs, &target_os);
 
     assert_ne!(llama_libs.len(), 0);
+    let mut native_artifacts = std::collections::BTreeMap::new();
+    for library in &llama_libs {
+        insert_artifact(
+            &mut native_artifacts,
+            ArtifactInput::produced(linked_artifact_name(&library.name), library.path.clone()),
+        );
+    }
+
+    if cfg!(feature = "common") {
+        let wrapper = find_static_archive(&out_dir, "llama_cpp_sys_2_common_wrapper")
+            .expect("common wrapper archive was not produced");
+        insert_artifact(
+            &mut native_artifacts,
+            ArtifactInput::produced("common/llama_cpp_sys_2_common_wrapper/link", wrapper),
+        );
+    }
+    if cfg!(feature = "mtmd") {
+        let mtmd = find_static_archive(&out_dir, "mtmd").expect("mtmd archive was not produced");
+        insert_artifact(
+            &mut native_artifacts,
+            ArtifactInput::produced("mtmd/mtmd/link", mtmd),
+        );
+    }
 
     let common_lib_dir = out_dir.join("build").join("common");
     if cfg!(feature = "common") && common_lib_dir.is_dir() {
@@ -1298,24 +1409,69 @@ fn main() {
             common_search_dirs.push(common_profile_dir);
         }
 
-        if library_file_exists(
+        let mut all_common_search_dirs = vec![
+            out_dir.join("lib"),
+            out_dir.join("lib64"),
+            build_dir.clone(),
+        ];
+        all_common_search_dirs.extend(common_search_dirs.iter().cloned());
+
+        if find_library_file(
             &common_search_dirs,
             "llama-common",
             build_shared_libs,
             &target_os,
-        ) {
-            println!("cargo:rustc-link-lib={llama_libs_kind}=llama-common");
-            if library_file_exists(
+        )
+        .is_some()
+        {
+            println!("cargo:rustc-link-lib={local_libs_kind}=llama-common");
+            let selected = find_library_file(
+                &all_common_search_dirs,
+                "llama-common",
+                build_shared_libs,
+                &target_os,
+            )
+            .expect("llama-common link artifact disappeared");
+            insert_artifact(
+                &mut native_artifacts,
+                ArtifactInput::produced("common/llama-common/link", selected),
+            );
+            if find_library_file(
                 &common_search_dirs,
                 "llama-common-base",
                 build_shared_libs,
                 &target_os,
-            ) {
-                println!("cargo:rustc-link-lib={llama_libs_kind}=llama-common-base");
+            )
+            .is_some()
+            {
+                println!("cargo:rustc-link-lib={local_libs_kind}=llama-common-base");
+                let selected = find_library_file(
+                    &all_common_search_dirs,
+                    "llama-common-base",
+                    build_shared_libs,
+                    &target_os,
+                )
+                .expect("llama-common-base link artifact disappeared");
+                insert_artifact(
+                    &mut native_artifacts,
+                    ArtifactInput::produced("common/llama-common-base/link", selected),
+                );
             }
-        } else if library_file_exists(&common_search_dirs, "common", build_shared_libs, &target_os)
+        } else if find_library_file(&common_search_dirs, "common", build_shared_libs, &target_os)
+            .is_some()
         {
-            println!("cargo:rustc-link-lib={llama_libs_kind}=common");
+            println!("cargo:rustc-link-lib={local_libs_kind}=common");
+            let selected = find_library_file(
+                &all_common_search_dirs,
+                "common",
+                build_shared_libs,
+                &target_os,
+            )
+            .expect("common link artifact disappeared");
+            insert_artifact(
+                &mut native_artifacts,
+                ArtifactInput::produced("common/common/link", selected),
+            );
         } else {
             println!(
                 "cargo:warning=common feature was enabled, but no common library was found in {}",
@@ -1325,12 +1481,15 @@ fn main() {
     }
 
     if cfg!(feature = "system-ggml") {
-        println!("cargo:rustc-link-lib={llama_libs_kind}=ggml");
-        println!("cargo:rustc-link-lib={llama_libs_kind}=ggml-base");
-        println!("cargo:rustc-link-lib={llama_libs_kind}=ggml-cpu");
+        println!("cargo:rustc-link-lib={system_ggml_libs_kind}=ggml");
+        println!("cargo:rustc-link-lib={system_ggml_libs_kind}=ggml-base");
+        println!("cargo:rustc-link-lib={system_ggml_libs_kind}=ggml-cpu");
+        for artifact in system_ggml_artifacts {
+            insert_artifact(&mut native_artifacts, artifact);
+        }
     }
-    for lib in llama_libs {
-        let link = format!("cargo:rustc-link-lib={}={}", llama_libs_kind, lib);
+    for lib in &llama_libs {
+        let link = format!("cargo:rustc-link-lib={local_libs_kind}={}", lib.name);
         debug_log!("LINK {link}",);
         println!("{link}",);
     }
@@ -1405,6 +1564,21 @@ fn main() {
     // copy DLLs to target
     if build_shared_libs {
         let libs_assets = extract_lib_assets(&out_dir, &target_os);
+        if matches!(&target_os, TargetOs::Windows(_)) {
+            for asset in &libs_assets {
+                let filename = asset
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("native runtime artifact has a non-UTF-8 filename");
+                insert_artifact(
+                    &mut native_artifacts,
+                    ArtifactInput::produced(
+                        runtime_artifact_name(filename, "native"),
+                        asset.clone(),
+                    ),
+                );
+            }
+        }
         for asset in libs_assets {
             let asset_clone = asset.clone();
             let filename = asset_clone.file_name().unwrap();
@@ -1432,4 +1606,58 @@ fn main() {
             }
         }
     }
+
+    if cfg!(feature = "dynamic-backends") {
+        let backend_assets = extract_shared_assets_in(&out_dir.join("backends"), &target_os);
+        assert!(
+            !backend_assets.is_empty(),
+            "dynamic-backends produced no runtime backend modules"
+        );
+        for asset in backend_assets {
+            let filename = asset
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("backend runtime artifact has a non-UTF-8 filename");
+            insert_artifact(
+                &mut native_artifacts,
+                ArtifactInput::produced(runtime_artifact_name(filename, "backend"), asset),
+            );
+        }
+    }
+
+    let linkage = LinkageEvidence {
+        local: if build_shared_libs {
+            NativeLinkage::Shared
+        } else {
+            NativeLinkage::Static
+        },
+        ggml_origin: if cfg!(feature = "system-ggml") {
+            GgmlOrigin::System
+        } else {
+            GgmlOrigin::Vendored
+        },
+        ggml: if cfg!(feature = "system-ggml") {
+            if cfg!(feature = "system-ggml-static") {
+                NativeLinkage::Static
+            } else {
+                NativeLinkage::Shared
+            }
+        } else if build_shared_libs {
+            NativeLinkage::Shared
+        } else {
+            NativeLinkage::Static
+        },
+        backends: if cfg!(feature = "dynamic-backends") {
+            BackendLinkage::DynamicModules
+        } else {
+            BackendLinkage::Linked
+        },
+    };
+    let evidence = BuildEvidence::collect(
+        effective_features,
+        linkage,
+        native_artifacts.into_values().collect(),
+    )
+    .unwrap_or_else(|error| panic!("cannot emit native build evidence: {error}"));
+    evidence.emit_cargo_metadata();
 }
