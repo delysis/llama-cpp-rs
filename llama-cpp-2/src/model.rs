@@ -3,8 +3,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::num::NonZeroU16;
 use std::os::raw::c_int;
 use std::path::Path;
-use std::ptr::{self, NonNull};
-use std::slice;
+use std::ptr::NonNull;
 use std::str::Utf8Error;
 
 use crate::context::params::LlamaContextParams;
@@ -32,10 +31,10 @@ pub struct LlamaModel {
 
 /// A safe wrapper around `llama_lora_adapter`.
 #[derive(Debug)]
-#[repr(transparent)]
 #[allow(clippy::module_name_repetitions)]
-pub struct LlamaLoraAdapter {
+pub struct LlamaLoraAdapter<'model> {
     pub(crate) lora_adapter: NonNull<llama_cpp_sys_2::llama_adapter_lora>,
+    pub(crate) model: &'model LlamaModel,
 }
 
 /// A performance-friendly wrapper around [`LlamaModel::chat_template`] which is then
@@ -788,7 +787,7 @@ impl LlamaModel {
     pub fn lora_adapter_init(
         &self,
         path: impl AsRef<Path>,
-    ) -> Result<LlamaLoraAdapter, LlamaLoraAdapterInitError> {
+    ) -> Result<LlamaLoraAdapter<'_>, LlamaLoraAdapterInitError> {
         let path = path.as_ref();
         debug_assert!(Path::new(path).exists(), "{path:?} does not exist");
 
@@ -807,6 +806,7 @@ impl LlamaModel {
         tracing::debug!(?path, "Initialized lora adapter");
         Ok(LlamaLoraAdapter {
             lora_adapter: adapter,
+            model: self,
         })
     }
 
@@ -895,10 +895,12 @@ impl LlamaModel {
 
         let mut sampler_configs: Vec<llama_cpp_sys_2::llama_sampler_seq_config> = samplers
             .iter()
-            .map(|(seq_id, sampler)| llama_cpp_sys_2::llama_sampler_seq_config {
-                seq_id: *seq_id,
-                sampler: sampler.sampler,
-            })
+            .map(
+                |(seq_id, sampler)| llama_cpp_sys_2::llama_sampler_seq_config {
+                    seq_id: *seq_id,
+                    sampler: sampler.sampler,
+                },
+            )
             .collect();
 
         if !sampler_configs.is_empty() {
@@ -911,7 +913,12 @@ impl LlamaModel {
         };
         let context = NonNull::new(context).ok_or(LlamaContextLoadError::NullReturn)?;
 
-        Ok(LlamaContext::with_samplers(self, context, params.embeddings(), samplers))
+        Ok(LlamaContext::with_samplers(
+            self,
+            context,
+            params.embeddings(),
+            samplers,
+        ))
     }
 
     /// Apply the models chat template to some messages.
