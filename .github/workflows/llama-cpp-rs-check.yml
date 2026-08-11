@@ -1,6 +1,9 @@
 name: Llama Cpp Rs Check
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main
@@ -50,7 +53,9 @@ jobs:
       - name: Test
         run: cargo test --features sampler
       - name: Dry-Run Publishing
-        run: RUST_BACKTRACE=1 cargo publish --workspace --verbose --dry-run
+        run: |
+          RUST_BACKTRACE=1 cargo publish --package llama-cpp-sys-2 --verbose --dry-run
+          RUST_BACKTRACE=1 cargo publish --package llama-cpp-2 --verbose --dry-run
   arm64:
     name: Check that it builds on various targets
     runs-on: ubuntu-latest
