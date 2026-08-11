@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="${1:-.}"
+failed=0
+
+while IFS= read -r -d '' file; do
+  while IFS= read -r line; do
+    use="${line#*uses: }"
+    use="${use%%[[:space:]#]*}"
+
+    case "$use" in
+      ./*|docker://*) continue ;;
+    esac
+
+    if [[ ! "$use" =~ ^[^/@]+/[^/@]+@[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "mutable or malformed action reference: $file: $use" >&2
+      failed=1
+    fi
+  done < <(grep -E '^[[:space:]]*-[[:space:]]+uses:[[:space:]]+' "$file" || true)
+
+  if grep -nE '\bssh-keyscan\b' "$file"; then
+    printf '%s\n' "live ssh-keyscan is forbidden in $file" >&2
+    failed=1
+  fi
+done < <(find "$root/.github/workflows" -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
+
+exit "$failed"
