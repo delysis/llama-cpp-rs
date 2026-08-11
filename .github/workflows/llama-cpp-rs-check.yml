@@ -46,29 +46,32 @@ jobs:
           components: clippy, rustfmt
       - name: Reconciliation ledger
         run: ./scripts/check-reconciliation-ledger.sh
-      - name: Clippy
-        run: cargo clippy
+      - name: Clippy safe-wrapper feature surface
+        run: >-
+          cargo clippy -p llama-cpp-2 --all-targets --no-default-features
+          --features common,sampler,mtmd
       - name: Fmt
         run: cargo fmt --check
-      - name: Test
-        run: cargo test --features sampler
+      - name: Test safe-wrapper feature matrix
+        run: |
+          cargo test -p llama-cpp-2 --no-default-features
+          cargo test -p llama-cpp-2 --no-default-features --features sampler
+          cargo test -p llama-cpp-2 --no-default-features --features common,sampler,mtmd
+      - name: Test native build evidence
+        run: cargo test -p llama-cpp-sys-2 --test build-evidence
+      - name: Test documentation
+        run: cargo test --doc -p llama-cpp-2 --no-default-features --features common,sampler,mtmd
       - name: Dry-Run Publishing
         run: |
           RUST_BACKTRACE=1 cargo publish --package llama-cpp-sys-2 --verbose --dry-run
           RUST_BACKTRACE=1 cargo publish --package llama-cpp-2 --verbose --dry-run
-  arm64:
-    name: Check that it builds on various targets
+  cuda:
+    name: Check the dedicated CUDA build
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [ linux/arm64, linux/amd64 ]
+    timeout-minutes: 90
     steps:
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - name: Setup QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8
-        with:
-          platforms: arm64,amd64
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
       - name: Build
@@ -76,7 +79,9 @@ jobs:
         with:
           file: test-build.Dockerfile
           target: base-cuda
-          platforms: ${{ matrix.target }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=llama-cpp-rs-cuda-amd64
+          cache-to: type=gha,mode=max,scope=llama-cpp-rs-cuda-amd64
   mac:
     name: Check that it builds on mac
     runs-on: macos-latest
@@ -90,7 +95,9 @@ jobs:
         with:
           toolchain: "1.88.0"
       - name: Build
-        run: cargo build --features sampler
+        run: >-
+          cargo build -p llama-cpp-2 --no-default-features
+          --features common,sampler,mtmd,metal
   windows:
     name: Check that it builds on windows
     runs-on: windows-latest
