@@ -5,6 +5,7 @@ on:
   workflow_dispatch: { }
 
 permissions:
+  actions: write
   pull-requests: write
   contents: write
 
@@ -40,3 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh pr create --fill --head update-llama-cpp-${{ env.DATE }} --title "Updated llama-cpp (bot)"
+      - name: Run checks for update branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run llama-cpp-rs-check.yml --ref update-llama-cpp-${{ env.DATE }}

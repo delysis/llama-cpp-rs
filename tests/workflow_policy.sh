@@ -41,12 +41,16 @@ fi
 rm "$fixture/.github/workflows/check.yml"
 cat > "$fixture/.github/workflows/update-llama-cpp.yml" <<'YAML'
 permissions:
+  actions: write
   pull-requests: write
   contents: write
 steps:
   - env:
       GH_TOKEN: ${{ github.token }}
     run: gh pr create --fill
+  - env:
+      GH_TOKEN: ${{ github.token }}
+    run: gh workflow run llama-cpp-rs-check.yml --ref update-llama-cpp-${{ env.DATE }}
 YAML
 "$checker" "$fixture"
 
@@ -62,13 +66,17 @@ fi
 
 cat > "$fixture/.github/workflows/update-llama-cpp.yml" <<'YAML'
 permissions:
+  actions: write
   pull-requests: write
   contents: write
-  actions: write
+  issues: write
 steps:
   - env:
       GH_TOKEN: ${{ github.token }}
     run: gh pr create --fill
+  - env:
+      GH_TOKEN: ${{ github.token }}
+    run: gh workflow run llama-cpp-rs-check.yml --ref update-llama-cpp-${{ env.DATE }}
 YAML
 if "$checker" "$fixture" >/dev/null 2>&1; then
   echo "excess nightly updater permission unexpectedly passed" >&2

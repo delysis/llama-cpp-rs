@@ -33,11 +33,13 @@ done < <(find "$root/.github/workflows" -type f \( -name '*.yml' -o -name '*.yam
 nightly="$root/.github/workflows/update-llama-cpp.yml"
 if [[ -f "$nightly" ]]; then
   permission_entries=0
+  actions_write=0
   contents_write=0
   pull_requests_write=0
   while IFS= read -r permission; do
     permission_entries=$((permission_entries + 1))
     case "$permission" in
+      actions:write) actions_write=1 ;;
       contents:write) contents_write=1 ;;
       pull-requests:write) pull_requests_write=1 ;;
       *)
@@ -56,8 +58,8 @@ if [[ -f "$nightly" ]]; then
     ' "$nightly"
   )
 
-  if [[ "$permission_entries" -ne 2 || "$contents_write" -ne 1 || "$pull_requests_write" -ne 1 ]]; then
-    printf '%s\n' "nightly updater requires only contents and pull-request write access" >&2
+  if [[ "$permission_entries" -ne 3 || "$actions_write" -ne 1 || "$contents_write" -ne 1 || "$pull_requests_write" -ne 1 ]]; then
+    printf '%s\n' "nightly updater requires only actions, contents, and pull-request write access" >&2
     failed=1
   fi
 
@@ -68,6 +70,11 @@ if [[ -f "$nightly" ]]; then
 
   if ! grep -Fq 'GH_TOKEN: ${{ github.token }}' "$nightly"; then
     printf '%s\n' "nightly updater must authenticate gh with the workflow token" >&2
+    failed=1
+  fi
+
+  if ! grep -Fq 'gh workflow run llama-cpp-rs-check.yml --ref update-llama-cpp-${{ env.DATE }}' "$nightly"; then
+    printf '%s\n' "nightly updater must explicitly dispatch checks for its generated branch" >&2
     failed=1
   fi
 fi
