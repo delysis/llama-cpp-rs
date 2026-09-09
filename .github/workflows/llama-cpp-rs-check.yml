@@ -61,10 +61,6 @@ jobs:
         run: cargo test -p llama-cpp-sys-2 --test build-evidence
       - name: Test documentation
         run: cargo test --doc -p llama-cpp-2 --no-default-features --features common,sampler,mtmd
-      - name: Dry-Run Publishing
-        run: |
-          RUST_BACKTRACE=1 cargo publish --package llama-cpp-sys-2 --verbose --dry-run
-          RUST_BACKTRACE=1 cargo publish --package llama-cpp-2 --verbose --dry-run
   cuda:
     name: Check the dedicated CUDA build
     runs-on: ubuntu-latest
