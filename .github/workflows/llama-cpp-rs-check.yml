@@ -64,7 +64,7 @@ jobs:
   cuda:
     name: Check the dedicated CUDA build
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - name: checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
