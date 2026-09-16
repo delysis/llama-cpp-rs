@@ -77,7 +77,8 @@ jobs:
           target: base-cuda
           platforms: linux/amd64
           cache-from: type=gha,scope=llama-cpp-rs-cuda-amd64
-          cache-to: type=gha,mode=max,scope=llama-cpp-rs-cuda-amd64
+          # Cache export is optional; leave the job deadline for compiling CUDA.
+          cache-to: type=gha,mode=max,scope=llama-cpp-rs-cuda-amd64,timeout=2m,ignore-error=true
   mac:
     name: Check that it builds on mac
     runs-on: macos-latest
