@@ -18,6 +18,7 @@ use crate::{
     LlamaLoraAdapterRemoveError, LlamaLoraAdapterSetError,
 };
 
+pub mod hidden_states;
 pub mod kv_cache;
 pub mod params;
 pub mod session;
@@ -32,6 +33,8 @@ pub struct LlamaContext<'a> {
     embeddings_enabled: bool,
     /// Backend samplers kept alive for the context's lifetime.
     _backend_samplers: Vec<(i32, LlamaSampler)>,
+    /// Dropped only after Drop has freed the native context and its scheduler.
+    pub(crate) hidden_state_capture: Option<Box<hidden_states::Capture>>,
 }
 
 impl Debug for LlamaContext<'_> {
@@ -54,6 +57,7 @@ impl<'model> LlamaContext<'model> {
             initialized_logits: Vec::new(),
             embeddings_enabled,
             _backend_samplers: Vec::new(),
+            hidden_state_capture: None,
         }
     }
 
@@ -69,6 +73,7 @@ impl<'model> LlamaContext<'model> {
             initialized_logits: Vec::new(),
             embeddings_enabled,
             _backend_samplers: backend_samplers,
+            hidden_state_capture: None,
         }
     }
 
@@ -111,8 +116,14 @@ impl<'model> LlamaContext<'model> {
     ///
     /// - the returned [`std::ffi::c_int`] from llama-cpp does not fit into a i32 (this should never happen on most systems)
     pub fn decode(&mut self, batch: &mut LlamaBatch) -> Result<(), DecodeError> {
+        if let Some(capture) = &self.hidden_state_capture {
+            capture.begin(batch, self.n_ubatch());
+        }
         let result =
             unsafe { llama_cpp_sys_2::llama_decode(self.context.as_ptr(), batch.llama_batch) };
+        if let Some(capture) = &self.hidden_state_capture {
+            capture.finish(result == 0);
+        }
 
         match NonZeroI32::new(result) {
             None => {
@@ -134,6 +145,9 @@ impl<'model> LlamaContext<'model> {
     ///
     /// - the returned [`std::ffi::c_int`] from llama-cpp does not fit into a i32 (this should never happen on most systems)
     pub fn encode(&mut self, batch: &mut LlamaBatch) -> Result<(), EncodeError> {
+        if let Some(capture) = &self.hidden_state_capture {
+            capture.unsupported();
+        }
         let result =
             unsafe { llama_cpp_sys_2::llama_encode(self.context.as_ptr(), batch.llama_batch) };
 
@@ -145,6 +159,49 @@ impl<'model> LlamaContext<'model> {
             }
             Some(error) => Err(EncodeError::from(error)),
         }
+    }
+
+    /// Enable or disable capture, always clearing any pending readout/error.
+    ///
+    /// Capture starts enabled. Disable it before prefill to avoid tensor reads;
+    /// enable it immediately before decoding the final singleton token. Calling
+    /// this with `true` while already enabled also resets the readout. This does
+    /// not change control vectors or KV state. Poisoned callback state cannot be
+    /// reset; create a new context in that case.
+    ///
+    /// # Errors
+    /// Returns `NotEnabled` if no capture callback was installed, or
+    /// `CallbackFailed` if the callback state is poisoned.
+    pub fn set_hidden_state_capture_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), hidden_states::HiddenStateCaptureError> {
+        self.hidden_state_capture
+            .as_ref()
+            .ok_or(hidden_states::HiddenStateCaptureError::NotEnabled)?
+            .set_enabled(enabled)
+    }
+
+    /// Take the last successful decode's owned per-layer residual vectors.
+    ///
+    /// Requires construction with [`LlamaModel::new_context_with_hidden_state_capture`].
+    /// Each decode replaces the previous observation, including on failure. A
+    /// successful take consumes the observation. The batch must contain a single
+    /// sequence with increasing positions, fit in `n_ubatch`, and request logits
+    /// for its final token. Returned vectors follow the configured layer order.
+    /// Capture errors do not abort native decode or invalidate otherwise valid
+    /// logits; callers must check this result separately from `decode`.
+    ///
+    /// # Errors
+    /// Returns an error for disabled capture, no observation, unsupported batches
+    /// or tensors, missing/duplicate layers, allocation failure, or non-finite data.
+    pub fn take_hidden_states(
+        &mut self,
+    ) -> Result<Vec<hidden_states::LayerHiddenState>, hidden_states::HiddenStateCaptureError> {
+        self.hidden_state_capture
+            .as_ref()
+            .ok_or(hidden_states::HiddenStateCaptureError::NotEnabled)?
+            .take()
     }
 
     /// Get the embeddings for the `i`th sequence in the current context.
