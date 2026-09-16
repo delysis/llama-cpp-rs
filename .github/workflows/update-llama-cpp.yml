@@ -5,6 +5,7 @@ on:
   workflow_dispatch: { }
 
 permissions:
+  actions: write
   pull-requests: write
   contents: write
 
@@ -33,13 +34,14 @@ jobs:
         run: git push --set-upstream origin update-llama-cpp-${{ env.DATE }} --force
       - name: Close any outdated PRs
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh pr list --json number,title --jq '.[] | select(.title | contains("Updated llama-cpp (bot)")) | .number' | xargs -I {} gh pr close {}
       - name: Create open PR
         env:
-          GITHUB_TOKEN: ${{ secrets.LLAMA_CPP_RS_UPDATE_LLAMA_CPP_ACTION}}
-        run: |
-          unset GITHUB_TOKEN
-          echo ${{ secrets.LLAMA_CPP_RS_UPDATE_LLAMA_CPP_ACTION }} | gh auth login --with-token
-          gh pr create --fill --head update-llama-cpp-${{ env.DATE }} --title "Updated llama-cpp (bot)"
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr create --fill --head update-llama-cpp-${{ env.DATE }} --title "Updated llama-cpp (bot)"
+      - name: Run checks for update branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run llama-cpp-rs-check.yml --ref update-llama-cpp-${{ env.DATE }}

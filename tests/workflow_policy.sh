@@ -31,4 +31,56 @@ if "$checker" "$fixture" >/dev/null 2>&1; then
   exit 1
 fi
 
+write_workflow 'steps:
+  - run: gh auth login --with-token'
+if "$checker" "$fixture" >/dev/null 2>&1; then
+  echo "interactive gh authentication unexpectedly passed" >&2
+  exit 1
+fi
+
+rm "$fixture/.github/workflows/check.yml"
+cat > "$fixture/.github/workflows/update-llama-cpp.yml" <<'YAML'
+permissions:
+  actions: write
+  pull-requests: write
+  contents: write
+steps:
+  - env:
+      GH_TOKEN: ${{ github.token }}
+    run: gh pr create --fill
+  - env:
+      GH_TOKEN: ${{ github.token }}
+    run: gh workflow run llama-cpp-rs-check.yml --ref update-llama-cpp-${{ env.DATE }}
+YAML
+"$checker" "$fixture"
+
+cat >> "$fixture/.github/workflows/update-llama-cpp.yml" <<'YAML'
+  - env:
+      GH_TOKEN: ${{ secrets.CUSTOM_PAT }}
+    run: gh pr edit 1
+YAML
+if "$checker" "$fixture" >/dev/null 2>&1; then
+  echo "custom nightly updater secret unexpectedly passed" >&2
+  exit 1
+fi
+
+cat > "$fixture/.github/workflows/update-llama-cpp.yml" <<'YAML'
+permissions:
+  actions: write
+  pull-requests: write
+  contents: write
+  issues: write
+steps:
+  - env:
+      GH_TOKEN: ${{ github.token }}
+    run: gh pr create --fill
+  - env:
+      GH_TOKEN: ${{ github.token }}
+    run: gh workflow run llama-cpp-rs-check.yml --ref update-llama-cpp-${{ env.DATE }}
+YAML
+if "$checker" "$fixture" >/dev/null 2>&1; then
+  echo "excess nightly updater permission unexpectedly passed" >&2
+  exit 1
+fi
+
 echo "workflow policy fixtures passed"
