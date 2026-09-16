@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "llama-cpp-sys-2"
 description = "Low Level Bindings to llama.cpp"
 version = "0.1.154"

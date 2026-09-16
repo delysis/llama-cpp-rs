@@ -500,24 +500,20 @@ impl LlamaContext<'_> {
     /// * `seq_id` - The sequence ID to get the state for.
     /// * `flags` - Optional flags (e.g., [`LlamaStateSeqFlags::PARTIAL_ONLY`]).
     ///
-    /// # Safety
-    ///
-    /// Destination needs to have allocated enough memory.
-    ///
     /// # Returns
     ///
     /// The number of bytes copied.
-    pub unsafe fn state_seq_get_data_ext(
+    pub fn state_seq_get_data_ext(
         &self,
-        dest: *mut u8,
+        dest: &mut [u8],
         seq_id: i32,
         flags: LlamaStateSeqFlags,
     ) -> usize {
         unsafe {
             llama_cpp_sys_2::llama_state_seq_get_data_ext(
                 self.context.as_ptr(),
-                dest,
-                usize::MAX,
+                dest.as_mut_ptr(),
+                dest.len(),
                 seq_id,
                 flags.0,
             )
@@ -588,15 +584,7 @@ impl LlamaContext<'_> {
             llama_cpp_sys_2::llama_state_seq_get_size_ext(self.context.as_ptr(), seq_id, flags.0)
         };
         let mut bytes = vec![0u8; size];
-        let n = unsafe {
-            llama_cpp_sys_2::llama_state_seq_get_data_ext(
-                self.context.as_ptr(),
-                bytes.as_mut_ptr(),
-                size,
-                seq_id,
-                flags.0,
-            )
-        };
+        let n = self.state_seq_get_data_ext(&mut bytes, seq_id, flags);
         if n != size {
             return Err(crate::StateSeqError::SizeMismatch {
                 expected: size,

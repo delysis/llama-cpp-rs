@@ -1,4 +1,5 @@
 [package]
+publish = false
 name = "llama-cpp-2"
 description = "llama.cpp bindings for Rust"
 version = "0.1.154"

@@ -1,3 +1,14 @@
+# delysis llama.cpp bindings fork
+
+This unreleased fork is consumed by exact Git revision. Its crate names and
+versions overlap upstream crates.io packages; it is not published there.
+The safe-wrapper feature matrix, native-build evidence, doctests, and platform
+builds validate this checkout and its pinned native submodule. Upstream registry
+publishing workflows are intentionally absent: a wrapper publication dry run
+would resolve the unrelated registry sys crate instead of this fork's sys crate.
+
+Upstream documentation follows.
+
 # 🦙 [llama-cpp-rs][readme] &emsp; [![Docs]][docs.rs] [![Latest Version]][crates.io] [![Lisence]][crates.io]
 
 [Docs]: https://img.shields.io/docsrs/llama-cpp-2.svg
