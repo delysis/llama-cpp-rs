@@ -849,6 +849,49 @@ impl LlamaModel {
         Ok(LlamaContext::new(self, context, params.embeddings()))
     }
 
+    /// Create a decoder context with bounded, owned last-token residual capture.
+    ///
+    /// Captures exact `l_out-{layer}` nodes using llama.cpp's evaluation callback.
+    /// For Gemma 4 these are post-block, post-control-vector, pre-final-norm.
+    /// Callback storage lives until after the native context is freed; callers
+    /// supply no pointers. See [`crate::context::hidden_states`] for limits and
+    /// [`LlamaContext::take_hidden_states`] for batch restrictions. This can force
+    /// backend synchronization at each selected layer and reduce throughput.
+    ///
+    /// # Errors
+    /// Rejects invalid layer selections, excessive dimensions, encoder/embedding
+    /// contexts, allocation failure, and native context creation failure. Graph
+    /// naming/layout support is checked at evaluation, not at construction.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new_context_with_hidden_state_capture<'a>(
+        &'a self,
+        _: &LlamaBackend,
+        params: LlamaContextParams,
+        config: crate::context::hidden_states::HiddenStateCaptureConfig,
+    ) -> Result<LlamaContext<'a>, crate::context::hidden_states::HiddenStateCaptureError> {
+        use crate::context::hidden_states::{callback, Capture, HiddenStateCaptureError as E};
+        // SAFETY: self owns the live native model for this entire operation.
+        if params.embeddings()
+            || unsafe { llama_cpp_sys_2::llama_model_has_encoder(self.model.as_ptr()) }
+            || !unsafe { llama_cpp_sys_2::llama_model_has_decoder(self.model.as_ptr()) }
+        {
+            return Err(E::UnsupportedContext);
+        }
+        let mut capture = Capture::new(config, self.n_embd(), self.n_layer())?;
+        let mut context_params = params.context_params;
+        context_params.cb_eval = Some(callback);
+        context_params.cb_eval_user_data = std::ptr::from_mut(capture.as_mut()).cast();
+        // SAFETY: capture's box has a stable address. It is kept alive through
+        // construction (including failure) and transferred to the context below.
+        let context = unsafe {
+            llama_cpp_sys_2::llama_new_context_with_model(self.model.as_ptr(), context_params)
+        };
+        let context = NonNull::new(context).ok_or(E::ContextCreationFailed)?;
+        let mut context = LlamaContext::new(self, context, false);
+        context.hidden_state_capture = Some(capture);
+        Ok(context)
+    }
+
     /// Create a new context bound to another context via llama.cpp's `ctx_other` field.
     ///
     /// This is required for MTP speculative decoding when the target model's
