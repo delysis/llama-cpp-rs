@@ -4,6 +4,12 @@
 //! Gemma 4 this is after block scaling and `build_cvec` (including any active
 //! control vector), but before final output normalization. Other architectures
 //! must emit the same nodes; missing nodes are errors, not empty observations.
+//!
+//! Requested readbacks can change backend graph fusion and numerical results.
+//! The strict local protocol qualifies CPU and Metal with
+//! `GGML_METAL_FUSION_DISABLE=1` set before backend/context creation. Default
+//! fused Metal fails the plain-versus-capture logits gate; see
+//! `docs/hidden-state-capture.md`. The API never changes process-wide settings.
 
 use std::ffi::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};

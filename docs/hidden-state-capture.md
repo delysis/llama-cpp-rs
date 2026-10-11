@@ -65,6 +65,29 @@ aborts are not recoverable Rust errors. Disabled capture still incurs native
 callback dispatch overhead and can synchronize at scheduler split boundaries,
 but requests no per-layer readback.
 
+## Qualified execution configuration
+
+The strict local Gemma 4 E2B base Q8_0 protocol passes on CPU and on Metal with
+`GGML_METAL_FUSION_DISABLE=1` set **before creating the backend/context**. This
+is an explicit execution configuration; the model file and original numerical
+tolerance are unchanged. It is not qualification of default fused Metal.
+
+On 2026-10-11 the default fused-Metal run failed the original plain-versus-capture
+logits gate. A separate negative control used the same prompt and batch shape:
+two plain contexts and callback-disabled capture agreed exactly; enabled capture
+was repeatable but differed from plain execution (maximum absolute logits delta
+0.0012512207; 76,659 of 262,144 logits outside the original tolerance). The pinned
+scheduler evaluates graph ranges around requested readbacks. Splitting those
+ranges changes Metal fusion opportunities; recording a residual is therefore
+an observable execution change under the default fused configuration.
+
+The original integration test remains unchanged and remains a failing gate for
+that configuration. Do not use default fused Metal for a claim that capture is
+numerically nonintervening. Do not silently set or change process-wide fusion
+settings inside the API. Callers must choose and record their execution profile.
+No other model/backend, training outcome, packaged product, or hosted CI pass is
+established by these local API checks.
+
 ## Opt-in Regression Protocol
 
 Preregistered before the local model run: use a synthetic fixed prompt, no
