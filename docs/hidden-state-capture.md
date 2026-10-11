@@ -122,7 +122,11 @@ LLAMA_HIDDEN_STATE_MODEL=/absolute/path/model.gguf \
 CPU is the default. Set `LLAMA_HIDDEN_STATE_GPU_LAYERS=99` to exercise a configured
 GPU backend. No scientific or training-quality result is implied by this test.
 
-## Local Verification (2026-09-16)
+## Historical reported verification (2026-09-16)
+
+The following source-reported results concern a different model and historical
+run. They are retained as provenance, not independently requalified here. The
+2026-10-11 execution matrix above is supported by current retained receipts.
 
 Base wrapper commit: `34444e2`; native submodule unchanged at the SHA above.
 Validated with Gemma 4 E4B IT Q8_0, snapshot
