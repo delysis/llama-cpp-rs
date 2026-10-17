@@ -47,6 +47,35 @@ macro_rules! debug_log {
     };
 }
 
+fn compile_cpp_archive(build: &cc::Build, name: &str, target_os: &TargetOs, out_dir: &Path) {
+    if !matches!(target_os, TargetOs::Apple(AppleVariant::MacOS)) {
+        build.compile(name);
+        return;
+    }
+    // cc prefixes object names with a hash of the absolute source directory.
+    // Those names become archive members even when the object bytes are stable.
+    // Use deterministic member names, retaining the real unmodified object bytes.
+    // Callers supply sources in a stable order; each archive owns its directory.
+    let stable_dir = out_dir.join(format!("stable-{name}-objects"));
+    std::fs::create_dir_all(&stable_dir).expect("create stable native object directory");
+    let objects = build.compile_intermediates();
+    let stable_objects: Vec<_> = objects
+        .iter()
+        .enumerate()
+        .map(|(index, object)| {
+            let stable = stable_dir.join(format!("{index:04}.o"));
+            std::fs::copy(object, &stable).expect("copy native object under stable member name");
+            stable
+        })
+        .collect();
+    // Compilation has already used the caller's flags. cc still owns archiver
+    // selection, deterministic archive flags and normal macOS C++ link metadata.
+    cc::Build::new()
+        .cpp(true)
+        .objects(&stable_objects)
+        .compile(name);
+}
+
 fn emit_compiler_static_archive_search_path(archive: &str) {
     let compiler = cc::Build::new().get_compiler();
     let Ok(output) = Command::new(compiler.path())
@@ -738,7 +767,12 @@ fn main() {
         if matches!(target_os, TargetOs::Apple(AppleVariant::MacOS)) {
             common_wrapper_build.flag(format!("-ffile-prefix-map={}=.", out_dir.display()));
         }
-        common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
+        compile_cpp_archive(
+            &common_wrapper_build,
+            "llama_cpp_sys_2_common_wrapper",
+            &target_os,
+            &out_dir,
+        );
     }
 
     // Build with Cmake
@@ -1243,8 +1277,12 @@ fn main() {
         if matches!(target_os, TargetOs::Android) && cfg!(feature = "static-stdcxx") {
             mtmd_build.cpp_link_stdlib(None);
         }
+        if matches!(target_os, TargetOs::Apple(AppleVariant::MacOS)) {
+            mtmd_build.flag(format!("-ffile-prefix-map={}=.", out_dir.display()));
+        }
 
         // Collect all .cpp files in tools/mtmd and its subdirectories
+        let mut mtmd_sources = Vec::new();
         for entry in glob(mtmd_src.join("**/*.cpp").to_str().unwrap()).unwrap() {
             match entry {
                 Ok(path) => {
@@ -1253,13 +1291,14 @@ fn main() {
                     if filename == "mtmd-cli.cpp" || filename == "deprecation-warning.cpp" {
                         continue;
                     }
-                    mtmd_build.file(&path);
+                    mtmd_sources.push(path);
                 }
                 Err(e) => println!("cargo:warning=mtmd glob error: {}", e),
             }
         }
-
-        mtmd_build.compile("mtmd");
+        mtmd_sources.sort();
+        mtmd_build.files(&mtmd_sources);
+        compile_cpp_archive(&mtmd_build, "mtmd", &target_os, &out_dir);
     }
 
     // Search paths
