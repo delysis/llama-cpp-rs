@@ -790,6 +790,14 @@ fn main() {
             config.define(&key, &value);
         }
     }
+    // The owned source overlay is below the consuming application's OUT_DIR.
+    // Git discovery there would report the app's revision, invalidating native
+    // state on unrelated UI commits. Bind GGML metadata to its actual source,
+    // after option forwarding so callers cannot substitute unrelated metadata.
+    config.define(
+        "GGML_BUILD_COMMIT",
+        "5f55650a78f92aff4d48d671423e888fac0469ff",
+    );
 
     // extract the target-cpu config value, if specified
     let target_cpu = std::env::var("CARGO_ENCODED_RUSTFLAGS")

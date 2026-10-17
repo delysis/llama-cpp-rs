@@ -51,6 +51,20 @@ pub fn prepare(manifest: &Path, out: &Path) -> PathBuf {
     ] {
         fs::copy(manifest.join(wrapper), root.join(wrapper)).expect("copy native wrapper");
     }
+    // Upstream GGML unconditionally discovers the enclosing Git repository.
+    // Honor the build script's pinned source revision instead; the overlay has
+    // no .git directory and lives inside an unrelated consuming repository.
+    let ggml_cmake = root.join("llama.cpp/ggml/CMakeLists.txt");
+    replace_once(
+        &ggml_cmake,
+        "find_program(GIT_EXE NAMES git git.exe NO_CMAKE_FIND_ROOT_PATH)\nif(GIT_EXE)",
+        "if(NOT DEFINED GGML_BUILD_COMMIT)\nfind_program(GIT_EXE NAMES git git.exe NO_CMAKE_FIND_ROOT_PATH)\nif(GIT_EXE)",
+    );
+    replace_once(
+        &ggml_cmake,
+        "endif()\n\nset(GGML_VERSION \"${GGML_VERSION_BASE}\")",
+        "endif()\nendif()\n\nset(GGML_VERSION \"${GGML_VERSION_BASE}\")",
+    );
     replace_once(&root.join("llama.cpp/include/llama.h"),
         "#define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2",
         "#define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2\n\n// Retain all resident SWA cells so a saved sequence can be cropped to an earlier prefix.\n// Requires a full-size SWA context to retain the complete history.\n#define LLAMA_STATE_SEQ_FLAGS_KEEP_ALL_SWA_CELLS 4");
