@@ -741,6 +741,9 @@ fn main() {
     // Build with Cmake
 
     let mut config = Config::new(&llama_src);
+    if cfg!(target_os = "macos") {
+        config.env("ZERO_AR_DATE", "1");
+    }
     config.define("LLAMA_BUILD_COMMIT", "5f55650-rewindable-swa");
     config.define("LLAMA_BUILD_NUMBER", "0");
 
