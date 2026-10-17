@@ -16,6 +16,7 @@ include = [
     "wrapper_mtmd.h",
     "build.rs",
     "build_evidence.rs",
+    "rewindable_swa.rs",
     "/src",
 
     "/llama.cpp/common/**/*.h",

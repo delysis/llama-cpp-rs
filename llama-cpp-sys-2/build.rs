@@ -9,6 +9,7 @@ use glob::glob;
 use walkdir::DirEntry;
 
 mod build_evidence;
+mod rewindable_swa;
 
 use build_evidence::{
     ArtifactInput, BackendLinkage, BuildEvidence, GgmlOrigin, LinkageEvidence, NativeLinkage,
@@ -478,6 +479,7 @@ fn is_hidden(e: &DirEntry) -> bool {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_evidence.rs");
+    println!("cargo:rerun-if-changed=rewindable_swa.rs");
 
     let effective_features = build_evidence::effective_features()
         .unwrap_or_else(|error| panic!("cannot determine native build features: {error}"));
@@ -488,7 +490,9 @@ fn main() {
 
     let target_dir = get_cargo_target_dir().unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("Failed to get CARGO_MANIFEST_DIR");
-    let llama_src = Path::new(&manifest_dir).join("llama.cpp");
+    let pristine_src = Path::new(&manifest_dir).join("llama.cpp");
+    let overlay = rewindable_swa::prepare(Path::new(&manifest_dir), &out_dir);
+    let llama_src = overlay.join("llama.cpp");
     let build_shared_libs = cfg!(feature = "dynamic-link");
 
     let build_shared_libs = std::env::var("LLAMA_BUILD_SHARED_LIBS")
@@ -511,11 +515,12 @@ fn main() {
 
     // Make sure that changes to the llama.cpp project trigger a rebuild.
     let rebuild_on_children_of = [
-        llama_src.join("src"),
-        llama_src.join("ggml/src"),
-        llama_src.join("common"),
+        pristine_src.join("src"),
+        pristine_src.join("ggml/src"),
+        pristine_src.join("common"),
+        pristine_src.join("include"),
     ];
-    for entry in walkdir::WalkDir::new(&llama_src)
+    for entry in walkdir::WalkDir::new(&pristine_src)
         .into_iter()
         .filter_entry(|e| !is_hidden(e))
     {
@@ -546,10 +551,13 @@ fn main() {
 
     // Bindings
     let mut bindings_builder = bindgen::Builder::default()
-        .header("wrapper.h")
+        .header(overlay.join("wrapper.h").to_str().unwrap())
         .clang_arg(format!("-I{}", llama_src.join("include").display()))
         .clang_arg(format!("-I{}", llama_src.join("ggml/include").display()))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(rewindable_swa::SourceCallbacks {
+            overlay: overlay.clone(),
+            manifest: PathBuf::from(&manifest_dir),
+        }))
         .derive_partialeq(true)
         .allowlist_function("ggml_.*")
         .allowlist_type("ggml_.*")
@@ -572,7 +580,7 @@ fn main() {
     // Configure mtmd feature if enabled
     if cfg!(feature = "mtmd") {
         bindings_builder = bindings_builder
-            .header("wrapper_mtmd.h")
+            .header(overlay.join("wrapper_mtmd.h").to_str().unwrap())
             .allowlist_function("mtmd_.*")
             .allowlist_type("mtmd_.*");
     }
@@ -708,7 +716,7 @@ fn main() {
         let mut common_wrapper_build = cc::Build::new();
         common_wrapper_build
             .cpp(true)
-            .file("wrapper_common.cpp")
+            .file(overlay.join("wrapper_common.cpp"))
             .include(&llama_src)
             .include(llama_src.join("common"))
             .include(llama_src.join("include"))
@@ -733,6 +741,8 @@ fn main() {
     // Build with Cmake
 
     let mut config = Config::new(&llama_src);
+    config.define("LLAMA_BUILD_COMMIT", "5f55650-rewindable-swa");
+    config.define("LLAMA_BUILD_NUMBER", "0");
 
     // Would require extra source files to pointlessly
     // be included in what's uploaded to and downloaded from

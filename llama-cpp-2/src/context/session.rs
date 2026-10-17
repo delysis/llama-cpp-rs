@@ -26,6 +26,10 @@ impl LlamaStateSeqFlags {
     /// prior states obtained for that `seq_id` with this flag set.
     pub const ON_DEVICE: LlamaStateSeqFlags = LlamaStateSeqFlags(2);
 
+    /// Preserve every resident SWA cell when exporting a rewindable sequence.
+    /// Full history requires a context configured with `swa_full`.
+    pub const KEEP_ALL_SWA_CELLS: LlamaStateSeqFlags = LlamaStateSeqFlags(4);
+
     /// Create an empty flags set.
     pub const fn empty() -> LlamaStateSeqFlags {
         LlamaStateSeqFlags(0)
