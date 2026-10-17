@@ -735,12 +735,25 @@ fn main() {
             common_wrapper_build.cpp_link_stdlib(None);
         }
 
+        if matches!(target_os, TargetOs::Apple(AppleVariant::MacOS)) {
+            common_wrapper_build.flag(format!("-ffile-prefix-map={}=.", out_dir.display()));
+        }
         common_wrapper_build.compile("llama_cpp_sys_2_common_wrapper");
     }
 
     // Build with Cmake
 
     let mut config = Config::new(&llama_src);
+    if matches!(target_os, TargetOs::Apple(AppleVariant::MacOS)) {
+        // Apply the same stable source spelling to C, C++, and assembler
+        // translation units in the CMake-built archives. `-ffile-prefix-map`
+        // also remaps __FILE__, unlike a debug-info-only prefix map.
+        let file_prefix_map = format!("-ffile-prefix-map={}=.", out_dir.display());
+        config
+            .cflag(&file_prefix_map)
+            .cxxflag(&file_prefix_map)
+            .asmflag(&file_prefix_map);
+    }
     if cfg!(target_os = "macos") {
         config.env("ZERO_AR_DATE", "1");
     }
